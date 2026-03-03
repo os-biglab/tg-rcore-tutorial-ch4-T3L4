@@ -18,7 +18,7 @@
 
 - 学：读本文件，了解相关OS知识，在某个开发环境（在线或本地）中正确编译运行rcore-tutorial-ch4；根据本章的`exercise.md`完成作业练习。
 - 教：分析并改进rcore-tutorial-ch4的文档和代码，让自己更高效地完成本章学习。
-- 用：基于rcore-tutorial-ch3的源代码，实现用户态单人俄罗斯方块游戏应用，支持方块旋转、行消除、计分、速度递增等基本功能；并扩展操作系统内核功能，支持用户态俄罗斯方块游戏应用。
+- 用：基于rcore-tutorial-ch4的源代码，实现用户态单人俄罗斯方块游戏应用，支持方块旋转、行消除、计分、速度递增等基本功能；并扩展操作系统内核功能，支持用户态俄罗斯方块游戏应用。[demo](https://github.com/rcore-os/tg-rcore-tutorial-game-demo/blob/main/ch4-tetris.gif)
 
 注：与AI充分合作，并保存与AI合作的交互过程，总结如何做到与AI合作提升自己的操作系统知识与能力。
 
