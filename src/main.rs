@@ -360,7 +360,7 @@ fn kernel_space(
 /// 用户传入的指针是虚拟地址，内核需要通过页表将其翻译为物理地址才能访问。
 mod impls {
     use crate::{build_flags, parse_flags, Sv39, PROCESSES};
-    use alloc::alloc::alloc_zeroed;
+    use alloc::alloc::{alloc_zeroed, dealloc};
     use core::{alloc::Layout, ptr::NonNull};
     use tg_console::log;
     use tg_kernel_vm::{
@@ -435,12 +435,26 @@ mod impls {
             NonNull::new(Self::page_alloc(len)).unwrap()
         }
 
-        fn deallocate(&mut self, _pte: Pte<Sv39>, _len: usize) -> usize {
-            todo!()
+        fn deallocate(&mut self, pte: Pte<Sv39>, len: usize) -> usize {
+            if !self.check_owned(pte) {
+                return 0;
+            }
+            unsafe {
+                dealloc(
+                    self.p_to_v::<u8>(pte.ppn()).as_ptr(),
+                    Layout::from_size_align_unchecked(len << Sv39::PAGE_BITS, 1 << Sv39::PAGE_BITS),
+                );
+            }
+            len
         }
 
         fn drop_root(&mut self) {
-            todo!()
+            unsafe {
+                dealloc(
+                    self.0.as_ptr().cast(),
+                    Layout::from_size_align_unchecked(1 << Sv39::PAGE_BITS, 1 << Sv39::PAGE_BITS),
+                );
+            }
         }
     }
 
