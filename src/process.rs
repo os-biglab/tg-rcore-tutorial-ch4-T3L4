@@ -33,6 +33,20 @@ use xmas_elf::{
     program, ElfFile,
 };
 
+const SYSCALL_COUNT_CAPACITY: usize = 5;
+
+fn syscall_idx(id: usize) -> Option<usize> {
+    use tg_syscall::SyscallId as Id;
+    match Id(id) {
+        Id::WRITE => Some(0),
+        Id::EXIT => Some(1),
+        Id::SCHED_YIELD => Some(2),
+        Id::CLOCK_GETTIME => Some(3),
+        Id::TRACE => Some(4),
+        _ => None,
+    }
+}
+
 /// 进程结构体
 ///
 /// 包含进程运行所需的全部信息：
@@ -49,6 +63,7 @@ pub struct Process {
     pub heap_bottom: usize,
     /// 当前程序 break 位置（堆顶）
     pub program_brk: usize,
+    syscall_counts: [usize; SYSCALL_COUNT_CAPACITY],
 }
 
 impl Process {
@@ -150,7 +165,25 @@ impl Process {
             address_space,
             heap_bottom,
             program_brk: heap_bottom,
+            syscall_counts: [0; SYSCALL_COUNT_CAPACITY],
         })
+    }
+
+    /// 记录一次系统调用计数。
+    #[inline]
+    pub fn record_syscall(&mut self, syscall_id: usize) {
+        if let Some(idx) = syscall_idx(syscall_id) {
+            self.syscall_counts[idx] += 1;
+        }
+    }
+
+    /// 查询指定系统调用号的计数。
+    #[inline]
+    pub fn syscall_count(&self, syscall_id: usize) -> usize {
+        syscall_idx(syscall_id)
+            .and_then(|idx| self.syscall_counts.get(idx))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// 修改程序 break 位置（实现 sbrk 系统调用）。

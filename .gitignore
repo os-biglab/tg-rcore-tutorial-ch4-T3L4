@@ -5,3 +5,4 @@ target
 Cargo.lock
 tg-user
 tg-checker
+tg-rcore-tutorial-user

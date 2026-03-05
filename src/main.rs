@@ -232,13 +232,13 @@ extern "C" fn schedule() -> ! {
 
     // 调度循环：持续执行直到所有进程完成
     while !unsafe { PROCESSES.get_mut().is_empty() } {
-        let ctx = unsafe { &mut PROCESSES.get_mut()[0].context };
+        let process = unsafe { &mut PROCESSES.get_mut()[0] };
         // 通过传送门执行用户进程：
         // 1. 跳转到传送门页面
         // 2. 在传送门内切换 satp 到用户地址空间
         // 3. 恢复用户寄存器，执行 sret 进入 U-mode
         // 4. 用户触发 Trap 后，传送门切换回内核地址空间
-        unsafe { ctx.execute(portal, ()) };
+        unsafe { process.context.execute(portal, ()) };
 
         // 处理 Trap
         match scause::read().cause() {
@@ -246,8 +246,10 @@ extern "C" fn schedule() -> ! {
             scause::Trap::Exception(scause::Exception::UserEnvCall) => {
                 use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
 
-                let ctx = &mut ctx.context;
-                let id: Id = ctx.a(7).into();
+                let process = unsafe { &mut PROCESSES.get_mut()[0] };
+                let id: Id = process.context.context.a(7).into();
+                process.record_syscall(id.0);
+                let ctx = &mut process.context.context;
                 let args = [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)];
                 match tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {
                     Ret::Done(ret) => match id {
@@ -270,10 +272,11 @@ extern "C" fn schedule() -> ! {
             }
             // ─── 其他异常/中断：杀死进程 ───
             e => {
+                let sepc = unsafe { PROCESSES.get_mut()[0].context.context.pc() };
                 log::error!(
                     "unsupported trap: {e:?}, stval = {:#x}, sepc = {:#x}",
                     stval::read(),
-                    ctx.context.pc()
+                    sepc
                 );
                 unsafe { PROCESSES.get_mut().remove(0) };
             }
@@ -356,7 +359,7 @@ fn kernel_space(
 /// 与前几章不同，本章的系统调用实现需要进行**地址翻译**：
 /// 用户传入的指针是虚拟地址，内核需要通过页表将其翻译为物理地址才能访问。
 mod impls {
-    use crate::{build_flags, Sv39, PROCESSES};
+    use crate::{build_flags, parse_flags, Sv39, PROCESSES};
     use alloc::alloc::alloc_zeroed;
     use core::{alloc::Layout, ptr::NonNull};
     use tg_console::log;
@@ -565,13 +568,31 @@ mod impls {
         #[inline]
         fn trace(
             &self,
-            _caller: Caller,
-            _trace_request: usize,
-            _id: usize,
-            _data: usize,
+            caller: Caller,
+            trace_request: usize,
+            id: usize,
+            data: usize,
         ) -> isize {
-            tg_console::log::info!("trace: not implemented");
-            -1
+            const READABLE: VmFlags<Sv39> = build_flags("U_RV");
+            const WRITABLE: VmFlags<Sv39> = build_flags("U_W_V");
+            let Some(process) = unsafe { PROCESSES.get_mut() }.get_mut(caller.entity) else {
+                return -1;
+            };
+            match trace_request {
+                0 => process
+                    .address_space
+                    .translate::<u8>(VAddr::new(id), READABLE)
+                    .map_or(-1, |ptr| unsafe { *ptr.as_ptr() as isize }),
+                1 => process
+                    .address_space
+                    .translate::<u8>(VAddr::new(id), WRITABLE)
+                    .map_or(-1, |mut ptr| {
+                        unsafe { *ptr.as_mut() = data as u8 };
+                        0
+                    }),
+                2 => process.syscall_count(id) as isize,
+                _ => -1,
+            }
         }
     }
 
@@ -582,7 +603,7 @@ mod impls {
     impl Memory for SyscallContext {
         fn mmap(
             &self,
-            _caller: Caller,
+            caller: Caller,
             addr: usize,
             len: usize,
             prot: i32,
@@ -590,15 +611,81 @@ mod impls {
             _fd: i32,
             _offset: usize,
         ) -> isize {
-            tg_console::log::info!(
-                "mmap: addr = {addr:#x}, len = {len}, prot = {prot}, not implemented"
+            let page_size = 1 << Sv39::PAGE_BITS;
+            let page_mask = page_size - 1;
+            if addr & page_mask != 0 {
+                return -1;
+            }
+            if prot & !0x7 != 0 || prot & 0x7 == 0 {
+                return -1;
+            }
+            let Some(end_addr) = addr.checked_add(len) else {
+                return -1;
+            };
+            let range = VAddr::<Sv39>::new(addr).floor()..VAddr::<Sv39>::new(end_addr).ceil();
+            let Some(process) = unsafe { PROCESSES.get_mut() }.get_mut(caller.entity) else {
+                return -1;
+            };
+            if process
+                .address_space
+                .areas
+                .iter()
+                .any(|area| area.start < range.end && range.start < area.end)
+            {
+                return -1;
+            }
+            if range.start == range.end {
+                return 0;
+            }
+
+            let mut flags: [u8; 5] = *b"U___V";
+            if prot & 0b100 != 0 {
+                flags[1] = b'X';
+            }
+            if prot & 0b010 != 0 {
+                flags[2] = b'W';
+            }
+            if prot & 0b001 != 0 {
+                flags[3] = b'R';
+            }
+            process.address_space.map(
+                range,
+                &[],
+                0,
+                parse_flags(unsafe { core::str::from_utf8_unchecked(&flags) }).unwrap(),
             );
-            -1
+            0
         }
 
-        fn munmap(&self, _caller: Caller, addr: usize, len: usize) -> isize {
-            tg_console::log::info!("munmap: addr = {addr:#x}, len = {len}, not implemented");
-            -1
+        fn munmap(&self, caller: Caller, addr: usize, len: usize) -> isize {
+            let page_size = 1 << Sv39::PAGE_BITS;
+            let page_mask = page_size - 1;
+            if addr & page_mask != 0 {
+                return -1;
+            }
+            let Some(end_addr) = addr.checked_add(len) else {
+                return -1;
+            };
+            let range = VAddr::<Sv39>::new(addr).floor()..VAddr::<Sv39>::new(end_addr).ceil();
+            let Some(process) = unsafe { PROCESSES.get_mut() }.get_mut(caller.entity) else {
+                return -1;
+            };
+            if range.start == range.end {
+                return 0;
+            }
+            for val in range.start.val()..range.end.val() {
+                let vpn = VPN::new(val);
+                if !process
+                    .address_space
+                    .areas
+                    .iter()
+                    .any(|area| area.start <= vpn && vpn < area.end)
+                {
+                    return -1;
+                }
+            }
+            process.address_space.unmap(range);
+            0
         }
     }
 }
