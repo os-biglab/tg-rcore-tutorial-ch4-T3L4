@@ -28,7 +28,10 @@
 #![cfg_attr(not(target_arch = "riscv64"), allow(dead_code, unused_imports))]
 
 // 进程管理模块：定义 Process 结构体，包含地址空间和上下文
+mod gpu;
+mod plic;
 mod process;
+mod uart;
 
 // 引入控制台输出宏（print! / println!），由 tg_console 库提供
 #[macro_use]
@@ -120,6 +123,10 @@ const MEMORY: usize = 24 << 20;
 // 使得切换 satp（地址空间）后代码仍然可以执行
 const PROTAL_TRANSIT: VPN<Sv39> = VPN::MAX;
 
+const SYSCALL_FRAMEBUFFER: usize = 0x1000_0001;
+const SYSCALL_FRAMEBUFFER_FLUSH: usize = 0x1000_0002;
+const SYSCALL_SET_INPUT_MODE: usize = 0x1000_0003;
+
 // ========== 进程列表 ==========
 
 /// 全局进程列表（用 UnsafeCell 包装以允许内部可变性）。
@@ -167,6 +174,11 @@ extern "C" fn rust_main() -> ! {
             MEMORY - layout.len(),
         ))
     };
+    #[cfg(target_arch = "riscv64")]
+    {
+        impls::init_graphics();
+        impls::init_input();
+    }
     // 第四步：分配异界传送门的物理页面
     // 传送门大小需要适配 1 个 slot（对应 1 个并发切换）
     let portal_size = MultislotPortal::calculate_size(1);
@@ -242,11 +254,45 @@ extern "C" fn schedule() -> ! {
 
         // 处理 Trap
         match scause::read().cause() {
+            scause::Trap::Interrupt(scause::Interrupt::SupervisorExternal) => {
+                impls::handle_external_interrupt();
+            }
             // ─── 系统调用 ───
             scause::Trap::Exception(scause::Exception::UserEnvCall) => {
                 use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
 
                 let process = unsafe { &mut PROCESSES.get_mut()[0] };
+                let raw_id = process.context.context.a(7);
+                if raw_id == SYSCALL_FRAMEBUFFER {
+                    match impls::framebuffer_info(process) {
+                        Some((fb_ptr, fb_len, width, height)) => {
+                            *process.context.context.a_mut(0) = fb_ptr;
+                            *process.context.context.a_mut(1) = fb_len;
+                            *process.context.context.a_mut(2) = width;
+                            *process.context.context.a_mut(3) = height;
+                        }
+                        None => {
+                            *process.context.context.a_mut(0) = usize::MAX;
+                            *process.context.context.a_mut(1) = 0;
+                            *process.context.context.a_mut(2) = 0;
+                            *process.context.context.a_mut(3) = 0;
+                        }
+                    }
+                    process.context.context.move_next();
+                    continue;
+                }
+                if raw_id == SYSCALL_FRAMEBUFFER_FLUSH {
+                    *process.context.context.a_mut(0) = impls::framebuffer_flush() as usize;
+                    process.context.context.move_next();
+                    continue;
+                }
+                if raw_id == SYSCALL_SET_INPUT_MODE {
+                    let mode = process.context.context.a(0) as u8;
+                    *process.context.context.a_mut(0) = impls::set_input_mode(mode) as usize;
+                    process.context.context.move_next();
+                    continue;
+                }
+
                 let id: Id = process.context.context.a(7).into();
                 process.record_syscall(id.0);
                 let ctx = &mut process.context.context;
@@ -308,6 +354,13 @@ fn kernel_space(
     memory: usize,
     portal: usize,
 ) -> AddressSpace<Sv39, Sv39Manager> {
+    const UART_MMIO_START: usize = 0x1000_0000;
+    const UART_MMIO_END: usize = 0x1000_1000;
+    const VIRTIO_MMIO_START: usize = 0x1000_1000;
+    const VIRTIO_MMIO_END: usize = 0x1001_0000;
+    const PLIC_MMIO_START: usize = 0x0c00_0000;
+    const PLIC_MMIO_END: usize = 0x0c40_0000;
+
     let mut space = AddressSpace::<Sv39, Sv39Manager>::new();
     // 映射内核各段（恒等映射：VPN == PPN）
     for region in layout.iter() {
@@ -339,6 +392,21 @@ fn kernel_space(
         PPN::new(s.floor().val()),
         build_flags("_WRV"),
     );
+    // 映射设备 MMIO（UART / VirtIO / PLIC），避免开启分页后访问设备寄存器触发页错误
+    for (name, start, end) in [
+        ("uart-mmio", UART_MMIO_START, UART_MMIO_END),
+        ("virtio-mmio", VIRTIO_MMIO_START, VIRTIO_MMIO_END),
+        ("plic-mmio", PLIC_MMIO_START, PLIC_MMIO_END),
+    ] {
+        log::info!("({name}) -> {start:#10x}..{end:#10x}");
+        let s = VAddr::<Sv39>::new(start);
+        let e = VAddr::<Sv39>::new(end);
+        space.map_extern(
+            s.floor()..e.ceil(),
+            PPN::new(s.floor().val()),
+            build_flags("_WRV"),
+        );
+    }
     // 映射异界传送门到虚拟地址空间最高页
     // 标志位 "__G_XWRV" 表示全局、可执行、可读写、有效
     space.map_extern(
@@ -359,15 +427,25 @@ fn kernel_space(
 /// 与前几章不同，本章的系统调用实现需要进行**地址翻译**：
 /// 用户传入的指针是虚拟地址，内核需要通过页表将其翻译为物理地址才能访问。
 mod impls {
-    use crate::{build_flags, parse_flags, Sv39, PROCESSES};
+    use crate::{build_flags, gpu, parse_flags, plic::{IntrTargetPriority, Plic}, uart, Sv39, PROCESSES};
     use alloc::alloc::{alloc_zeroed, dealloc};
-    use core::{alloc::Layout, ptr::NonNull};
+    use core::{alloc::Layout, ptr::NonNull, sync::atomic::{AtomicBool, AtomicU8, Ordering}};
     use tg_console::log;
     use tg_kernel_vm::{
         page_table::{MmuMeta, Pte, VAddr, VmFlags, PPN, VPN},
         PageManager,
     };
     use tg_syscall::*;
+
+    const MODE_POLLING: u8 = 0;
+    const MODE_INTERRUPT: u8 = 1;
+    const PLIC_BASE: usize = 0x0c00_0000;
+    const HART_ID: usize = 0;
+    const FB_VADDR: usize = 0x1000_0000;
+
+    static INPUT_MODE: AtomicU8 = AtomicU8::new(MODE_POLLING);
+    static INPUT_READY: AtomicBool = AtomicBool::new(false);
+    static INPUT_KEY: AtomicU8 = AtomicU8::new(0);
 
     /// Sv39 页表管理器：负责物理页的分配和映射。
     #[repr(transparent)]
@@ -476,6 +554,44 @@ mod impls {
     /// **与前几章的关键区别**：用户传入的 `buf` 是虚拟地址，
     /// 需要通过 `address_space.translate()` 翻译为物理地址才能访问。
     impl IO for SyscallContext {
+        fn read(&self, caller: Caller, fd: usize, buf: usize, count: usize) -> isize {
+            if count == 0 {
+                return 0;
+            }
+            match fd {
+                STDIN => {
+                    let mode = INPUT_MODE.load(Ordering::Acquire);
+                    let key = if mode == MODE_POLLING {
+                        pop_input_key().or_else(poll_uart_char)
+                    } else {
+                        pop_input_key()
+                    };
+
+                    let Some(c) = key else {
+                        return -2;
+                    };
+
+                    const WRITABLE: VmFlags<Sv39> = build_flags("U_W_V");
+                    if let Some(mut ptr) = unsafe { PROCESSES.get_mut() }
+                        .get_mut(caller.entity)
+                        .unwrap()
+                        .address_space
+                        .translate::<u8>(VAddr::new(buf), WRITABLE)
+                    {
+                        unsafe { *ptr.as_mut() = c };
+                        1
+                    } else {
+                        log::error!("ptr not writable");
+                        -1
+                    }
+                }
+                _ => {
+                    log::error!("unsupported fd: {fd}");
+                    -1
+                }
+            }
+        }
+
         fn write(&self, caller: Caller, fd: usize, buf: usize, count: usize) -> isize {
             match fd {
                 STDOUT | STDDEBUG => {
@@ -505,6 +621,158 @@ mod impls {
                 }
             }
         }
+    }
+
+    #[inline]
+    fn push_input_key(c: u8) {
+        INPUT_KEY.store(c, Ordering::Release);
+        INPUT_READY.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    fn pop_input_key() -> Option<u8> {
+        if INPUT_READY.swap(false, Ordering::AcqRel) {
+            Some(INPUT_KEY.load(Ordering::Acquire))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    #[inline]
+    fn poll_uart_char() -> Option<u8> {
+        uart::read_nonblocking()
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    #[inline]
+    fn poll_uart_char() -> Option<u8> {
+        None
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn uart_set_irq(enable: bool) {
+        uart::set_rx_interrupt(enable);
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    fn uart_set_irq(_enable: bool) {}
+
+    #[cfg(target_arch = "riscv64")]
+    fn plic_init_uart() {
+        let mut plic = unsafe { Plic::new(PLIC_BASE) };
+        plic.set_threshold(HART_ID, IntrTargetPriority::Supervisor, 0);
+        plic.set_threshold(HART_ID, IntrTargetPriority::Machine, 1);
+        plic.set_priority(uart::UART_IRQ as usize, 1);
+        plic.enable(HART_ID, IntrTargetPriority::Supervisor, uart::UART_IRQ as usize);
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    fn plic_init_uart() {}
+
+    #[cfg(target_arch = "riscv64")]
+    fn plic_claim() -> u32 {
+        let mut plic = unsafe { Plic::new(PLIC_BASE) };
+        plic.claim(HART_ID, IntrTargetPriority::Supervisor)
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    fn plic_claim() -> u32 {
+        0
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn plic_complete(irq: u32) {
+        let mut plic = unsafe { Plic::new(PLIC_BASE) };
+        plic.complete(HART_ID, IntrTargetPriority::Supervisor, irq);
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    fn plic_complete(_irq: u32) {}
+
+    fn apply_input_mode(mode: u8) {
+        INPUT_MODE.store(mode, Ordering::Release);
+        match mode {
+            MODE_INTERRUPT => {
+                uart_set_irq(true);
+                #[cfg(target_arch = "riscv64")]
+                unsafe {
+                    riscv::register::sie::set_sext();
+                }
+            }
+            _ => {
+                uart_set_irq(false);
+                #[cfg(target_arch = "riscv64")]
+                unsafe {
+                    riscv::register::sie::clear_sext();
+                }
+            }
+        }
+    }
+
+    /// 初始化图形子系统（VirtIO GPU 与 framebuffer）。
+    pub(crate) fn init_graphics() {
+        gpu::init_graphics();
+    }
+
+    /// 初始化输入子系统（默认轮询模式，开启 UART PLIC 路由）。
+    pub(crate) fn init_input() {
+        uart::init();
+        plic_init_uart();
+        apply_input_mode(MODE_POLLING);
+    }
+
+    /// 处理外部中断：在中断模式下通过 PLIC + UART 收集输入。
+    pub(crate) fn handle_external_interrupt() {
+        if INPUT_MODE.load(Ordering::Acquire) != MODE_INTERRUPT {
+            let irq = plic_claim();
+            if irq != 0 {
+                plic_complete(irq);
+            }
+            return;
+        }
+
+        let irq = plic_claim();
+        if irq == uart::UART_IRQ {
+            while let Some(c) = poll_uart_char() {
+                push_input_key(c);
+            }
+        }
+        if irq != 0 {
+            plic_complete(irq);
+        }
+    }
+
+    /// 设置输入模式系统调用后端：0 为轮询，1 为中断。
+    pub(crate) fn set_input_mode(mode: u8) -> isize {
+        match mode {
+            MODE_POLLING | MODE_INTERRUPT => {
+                apply_input_mode(mode);
+                0
+            }
+            _ => -1,
+        }
+    }
+
+    /// 返回 framebuffer 信息（固定用户虚拟地址、长度、宽、高）。
+    pub(crate) fn framebuffer_info(process: &mut crate::process::Process) -> Option<(usize, usize, usize, usize)> {
+        let (fb_ptr, fb_len, width, height) = gpu::framebuffer_info()?;
+        if !process.fb_mapped {
+            let start = VAddr::<Sv39>::new(FB_VADDR).floor();
+            let end = VAddr::<Sv39>::new(FB_VADDR + fb_len).ceil();
+            process.address_space.map_extern(
+                start..end,
+                PPN::new(fb_ptr >> Sv39::PAGE_BITS),
+                build_flags("U_WRV"),
+            );
+            process.fb_mapped = true;
+        }
+        Some((FB_VADDR, fb_len, width, height))
+    }
+
+    /// 触发 framebuffer flush。
+    pub(crate) fn framebuffer_flush() -> isize {
+        gpu::framebuffer_flush()
     }
 
     /// Process 系统调用实现

@@ -1,147 +1,175 @@
-# ch4-T1L2 软件架构总览
+# ch4-T3L4 架构总览
 
-本文描述 `tg-rcore-tutorial-ch4-T1L2` 作为独立 crate 的实现结构、执行路径与模块分工。
+## 1. 目标与范围
 
-## 1. 系统定位
+`tg-rcore-tutorial-ch4-T3L4` 是在 chapter 4 地址空间机制上继续扩展的教学内核，目标是让用户态单人俄罗斯方块运行在独立地址空间中，并且完成 framebuffer、输入与设备访问在 Sv39 下的正确接线。
 
-`ch4-T1L2` 是一个运行在 RISC-V S 态的 `no_std` 裸机内核样例，核心目标是把第三章“多任务调度”升级为“带 Sv39 地址空间隔离的进程系统”。
+整体目标分成两部分：
 
-该 crate 的关键能力：
+- **内核侧**：保留 chapter 4 的多进程/地址空间主线，补齐图形、输入和设备 MMIO 映射，提供 framebuffer 虚拟地址、flush 与输入模式切换 syscall；
+- **用户侧**：实现 `tetris.rs`，完成方块旋转、行消除、计分、速度递增，并使用增量渲染降低 framebuffer 写入量。
 
-- 为每个用户进程建立独立地址空间（Sv39）；
-- 通过 `ForeignContext + MultislotPortal` 支持跨地址空间上下文切换；
-- 基于 ELF `LOAD` 段完成用户程序装载；
-- 在 syscall 层对用户指针执行地址翻译与权限检查；
-- 支持基础内存管理 syscall（`sbrk`，以及 exercise 中的 `mmap/munmap`）。
+本 crate 仍为 `no_std`、`no_main` 的 RISC-V S-mode 教学内核。
 
-与 ch3 的核心差异：ch3 直接把用户地址当内核可访问地址，而 ch4 必须先通过页表翻译。
+## 2. 总体模块结构
 
----
+### 2.1 内核代码
 
-## 2. 目录与模块职责
+- `src/main.rs`
+      - 内核入口 `_start` 与 `rust_main`；
+      - 建立内核地址空间并启用 Sv39；
+      - 进程装载、调度与 trap 分发；
+      - syscall 分发与地址翻译；
+      - 图形与输入子系统统一接线。
+- `src/process.rs`
+      - `Process`：用户上下文、地址空间、堆边界与 syscall 计数；
+      - `Process::new()`：解析 ELF 并映射用户段与用户栈；
+      - `change_program_brk()`：实现 `sbrk`。
+- `src/gpu.rs`
+      - VirtIO GPU 初始化；
+      - framebuffer 地址、长度、宽高导出；
+      - framebuffer flush。
+- `src/uart.rs`
+      - UART 初始化、非阻塞读取、接收中断开关。
+- `src/plic.rs`
+      - PLIC priority / enable / threshold / claim / complete。
+- `build.rs`
+      - 解析 `tg-rcore-tutorial-user-T3L4/cases.toml`；
+      - 构建用户程序并生成 `APP_ASM`；
+      - 写入链接脚本。
 
-```text
-tg-rcore-tutorial-ch4-T1L2/
-├── .cargo/config.toml         # 目标平台、QEMU runner、tg-user 配置
-├── build.rs                   # 生成 linker.ld，构建用户程序并生成 APP_ASM
-├── Cargo.toml                 # crate 元信息、feature 与依赖
-├── README.md                  # 章节说明文档
-├── exercise.md                # 练习要求（trace 重写 + mmap/munmap）
-└── src/
-    ├── main.rs                # 启动、内核地址空间、调度、syscall 实现
-    └── process.rs             # 进程结构、ELF 加载、堆管理、syscall 计数
-```
+### 2.2 用户代码
 
----
+- `tg-rcore-tutorial-user-T3L3/src/lib.rs`
+      - 提供 `framebuffer_info()` / `framebuffer_flush()`；
+      - 提供 `getchar_poll()` / `getchar_blocking()`；
+      - 通过 syscall 与内核图形、输入能力连接。
+- `tg-rcore-tutorial-user-T3L3/src/bin/tetris.rs`
+      - 实现俄罗斯方块玩法；
+      - 支持轮询/中断式输入模式切换；
+      - 直接写 framebuffer，并进行增量渲染。
 
-## 3. 分层架构
+## 3. 内核侧实现流程
 
-```text
-用户程序（ELF + ecall）
-      │
-      ▼
-系统调用语义层（main.rs::impls::SyscallContext）
-      │
-      ▼
-进程/地址空间层（process.rs::Process + AddressSpace）
-      │
-      ▼
-页表/上下文切换层（tg-kernel-vm + tg-kernel-context/foreign）
-      │
-      ▼
-RISC-V Sv39 + QEMU virt
-```
+### 3.1 启动与装载
 
-### 3.1 `main.rs`：系统编排与运行时入口
+1. `rust_main` 启动后清零 BSS，初始化 console 和 syscall 分发器；
+2. 初始化图形与输入子系统；
+3. 根据 `tg_linker::AppMeta::locate()` 读取打包进镜像的用户程序；
+4. 为每个 app 创建 `Process`，并放入全局进程表；
+5. 创建调度线程并进入循环调度。
 
-负责系统级流程：
+### 3.2 Trap 与调度
 
-1. `rust_main` 初始化 BSS、控制台、内核堆；
-2. 建立内核地址空间（内核段恒等映射 + 堆映射 + 传送门映射）；
-3. 解析内置用户 ELF，创建 `Process` 并挂入全局进程表；
-4. 启动调度线程 `schedule`；
-5. 调度线程循环执行进程，处理 `ecall` 与异常，直到进程全部退出；
-6. 最终 `shutdown(false)`。
+主循环在进程返回后按 `scause` 分支：
 
-### 3.2 `process.rs`：进程对象与地址空间对象
+- `SupervisorTimer`：时间片到期，切换任务；
+- `SupervisorExternal`：处理外部中断，主要是 UART 输入；
+- `UserEnvCall`：处理 syscall；
+- 其他异常：终止进程。
 
-`Process` 聚合了：
+### 3.3 输入子系统
 
-- `ForeignContext`（用户上下文 + `satp`）；
-- `AddressSpace<Sv39, Sv39Manager>`（独立页表）；
-- 堆边界（`heap_bottom/program_brk`）；
-- 每进程 syscall 计数。
+输入侧复用了 chapter 3 的 UART / PLIC 模块：
 
-关键方法：
+- `IO::read` 支持 `STDIN`；
+- 轮询模式下优先返回缓存字符，否则非阻塞探测 UART；
+- 中断模式下通过 PLIC claim/complete + UART RX 中断收集字符；
+- 无输入时返回 `-2`，让用户态继续轮询或等待。
 
-- `Process::new(elf)`：校验 ELF，映射 `LOAD` 段，映射用户栈，构造 `satp`；
-- `change_program_brk(size)`：实现 `sbrk` 堆扩展/回收；
-- `record_syscall/syscall_count`：支持 trace 查询。
+### 3.4 图形子系统
 
-### 3.3 `impls`：syscall 与 VM 桥接层
+图形侧采用 VirtIO GPU + framebuffer：
 
-通过 `translate()` 把用户虚拟地址转换成内核可访问指针，并按 `VmFlags` 做读写权限校验。该层是 ch4 相比 ch3 的最大变化点。
+- `gpu.rs` 负责初始化 GPU 和 framebuffer；
+- 内核通过自定义 syscall 把 framebuffer 信息暴露给用户态；
+- 用户程序直接写 framebuffer，再调用 flush。
 
----
+在 chapter 4 地址空间下，framebuffer 必须映射到用户进程的虚拟地址空间中，因此内核额外维护“首次 syscall 时才建立映射”的状态。
 
-## 4. 启动与执行路径
+## 4. 用户态俄罗斯方块实现流程
 
-### 4.1 构建期（build-time）
+### 4.1 游戏状态
 
-- `build.rs` 生成 `linker.ld`；
-- 构建用户程序并生成 `app.asm`；
-- `global_asm!(APP_ASM)` 将用户程序内嵌进内核镜像。
+`tetris.rs` 维护：
 
-### 4.2 运行期（run-time）
+- 棋盘 10×20；
+- 当前方块、下一个方块、随机种子；
+- 分数、累计消行、等级、退出/结束状态；
+- 渲染缓存，用于增量刷新。
 
-1. `_start` 设栈后跳到 `rust_main`；
-2. `kernel_space()` 建立并激活内核页表；
-3. 每个 app 由 `Process::new()` 变成独立进程；
-4. `schedule()` 通过 `MultislotPortal` 进入用户地址空间执行；
-5. trap 返回后处理 syscall/异常并继续调度。
+### 4.2 输入模式
 
----
+启动时先让用户选择模式：
 
-## 5. 虚存设计关键点
+- `p`：轮询模式；
+- `i`：interrupt-like 模式。
 
-### 5.1 内核地址空间
+按键映射：
 
-- 内核段采用恒等映射（便于访问物理内存）；
-- 堆区域映射为可读写；
-- 传送门映射到最高虚页 `VPN::MAX`，内核与用户共享同一虚拟位置。
+- `A/D`：左右移动；
+- `W`：旋转；
+- `S`：软降；
+- 空格：硬降；
+- `Q`：退出。
 
-### 5.2 用户地址空间
+### 4.3 渲染策略
 
-- ELF `LOAD` 段按段权限映射（`X/W/R` + `U` + `V`）；
-- 用户栈映射到高地址固定区间（2 页）；
-- 进程堆从 `heap_bottom` 起，通过 `sbrk` 动态调整。
+用户态采用 framebuffer 直写，不使用字符终端：
 
-### 5.3 syscall 指针访问
+- 首帧绘制背景、边框和棋盘；
+- 后续按“上一帧状态 vs 当前帧状态”比较，只重绘变化格子；
+- 模式条、分数条、等级条、结束提示均采用局部增量更新；
+- 最后统一调用 `framebuffer_flush()`。
 
-- `write/clock_gettime/trace` 等 syscall 均先 `translate`；
-- 未翻译成功或权限不满足时返回 `-1`；
-- 避免跨地址空间直接解引用用户虚拟地址。
+这样可以显著降低每帧写入量，避免整屏重绘导致的性能问题。
 
----
+## 5. chapter 4 的关键设计点
 
-## 6. 配置与依赖
+### 5.1 固定 framebuffer 虚拟地址
 
-主要外部组件：
+用户态拿到的不是物理地址，而是固定虚拟地址：
 
-- `tg-kernel-vm`：页表与地址空间抽象；
-- `tg-kernel-context`（`foreign`）：跨地址空间上下文切换；
-- `tg-kernel-alloc`：内核堆分配；
-- `tg-syscall`：syscall 统一分发。
+- 约定 framebuffer 映射到 `0x1000_0000`；
+- 第一次调用 framebuffer syscall 时，内核把物理 framebuffer 映射到当前进程的地址空间；
+- 后续重复调用只返回信息，不重复建映射。
 
----
+这样用户程序始终访问同一虚拟地址，避免每次切换进程都改写渲染逻辑。
 
-## 7. 当前实现边界
+### 5.2 设备 MMIO 恒等映射
 
-为了教学最小闭环，当前实现不包含：
+由于 chapter 4 开启了地址空间，内核访问设备寄存器也必须有页表映射：
 
-- 复杂内存回收策略与碎片整理；
-- copy-on-write、按需分页等高级 VM 特性；
-- 多核并行调度；
-- 完整 POSIX 兼容内存语义。
+- UART：`0x1000_0000..0x1000_1000`
+- VirtIO MMIO：`0x1000_1000..0x1001_0000`
+- PLIC：`0x0c00_0000..0x0c40_0000`
 
-现有架构已足够支撑 chapter4 的地址空间、trace 重写、mmap/munmap 练习目标。
+如果不做这一步，调度线程进入后访问设备寄存器会直接触发页错误。
+
+### 5.3 进程级映射状态
+
+`Process` 中增加 framebuffer 是否已经映射的状态位，确保“只有第一次 syscall 时建立映射”。这避免重复映射同一虚拟区间，也避免多次调用 syscall 时重复修改地址空间。
+
+## 6. 用户程序装载策略
+
+`tg-rcore-tutorial-user-T3L4/cases.toml` 中：
+
+- `[ch4]` 仅保留 `tetris`；
+- `[ch4_exercise]` 同样仅保留 `tetris`。
+
+因此内核启动后只装载并运行俄罗斯方块应用。
+
+## 7. 关键设计取舍
+
+- 不引入更复杂的图形栈，仍采用 VirtIO GPU + framebuffer 直写；
+- 输入侧沿用 UART 非阻塞读取 + PLIC 接线；
+- framebuffer 地址采用固定虚拟地址，降低用户态复杂度；
+- 用户态渲染采用增量更新，减少 framebuffer 写入量；
+- 内核只在首次 framebuffer syscall 时建立映射，保持语义简单明确。
+
+## 8. 可扩展方向
+
+- 把 interrupt-like 模式升级为真正的外设中断驱动；
+- 为 framebuffer 增加更细粒度的脏矩形合并；
+- 增加更完整的旋转 kick 规则；
+- 把输入缓存升级为多字符队列。

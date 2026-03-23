@@ -1,157 +1,142 @@
-# ch4-T1L2 Exercise 实现报告（trace / mmap / munmap）
+# ch4-T3L4 增量设计实现报告
 
-本文对应 `exercise.md` 要求，说明当前 `tg-rcore-tutorial-ch4-T1L2` 中练习功能的实现方式与关键设计点。
+本文记录 `tg-rcore-tutorial-ch4-T3L4` 中“让用户态俄罗斯方块运行在地址空间下”的实现过程，重点说明内核侧与用户侧分别做了什么，以及中途遇到的问题和修复方式。
 
-## 1. 练习目标
+## 1. 任务目标回顾
 
-本次练习包含三项：
+本次实现目标如下：
 
-1. 在引入虚存后重写 `trace`，恢复读/写/统计功能；
-2. 新增 `mmap`（syscall id 222）匿名映射；
-3. 新增 `munmap`（syscall id 215）取消映射。
+1. 在 chapter 4 地址空间框架下运行用户态单人俄罗斯方块；
+2. 用户态支持方块旋转、行消除、计分、速度递增；
+3. framebuffer 采用固定用户虚拟地址，并由内核第一次 syscall 时建立映射；
+4. 将 chapter 3 已完成的 GPU / UART / PLIC 逻辑迁移到 chapter 4；
+5. 用户态采用增量渲染，减少 framebuffer 写入。
 
-相对 ch3 的本质变化：用户指针不能直接解引用，必须走页表翻译并检查权限。
+与 chapter 3 最大的不同是：chapter 4 开启了 Sv39 地址空间，设备访问、framebuffer 访问和用户指针访问都必须经过页表和映射管理。
 
----
+## 2. 修改清单
 
-## 2. 实现落点
+### 2.1 内核侧：图形与输入能力迁移
 
-- `src/main.rs`：
-  - `impl Trace for SyscallContext`（trace 重写）；
-  - `impl Memory for SyscallContext`（mmap/munmap）；
-  - 在 `schedule()` 中统一记录 syscall 次数。
-- `src/process.rs`：
-  - `record_syscall/syscall_count`；
-  - `address_space` 作为映射与翻译载体。
+- 将 `gpu.rs`、`uart.rs`、`plic.rs` 接入 `ch4-T3L4/src/main.rs`；
+- 初始化 GPU 后导出 framebuffer 信息和 flush；
+- 支持 UART 非阻塞读取和 PLIC 中断路由；
+- 增加三个自定义 syscall：
+  - `0x1000_0001`：framebuffer info；
+  - `0x1000_0002`：framebuffer flush；
+  - `0x1000_0003`：输入模式切换。
 
----
+### 2.2 内核侧：地址空间下的 framebuffer 映射
 
-## 3. trace 重写
+- 在 `Process` 中增加 framebuffer 映射状态位 `fb_mapped`；
+- 第一次调用 framebuffer syscall 时，把物理 framebuffer 映射到用户虚拟地址 `0x1000_0000`；
+- 后续调用只返回信息，不再重复映射；
+- 为避免页错误，内核地址空间显式映射 UART / VirtIO / PLIC 的 MMIO 区域。
 
-## 3.1 核心策略
+### 2.3 用户侧：tetris 程序
 
-通过 `process.address_space.translate::<u8>(VAddr::new(id), flags)` 完成：
+- 新增 `user-T3L3/src/bin/tetris.rs`；
+- 支持旋转、左右移动、软降、硬降；
+- 支持消行、计分、等级提升和速度递增；
+- 支持轮询 / interrupt-like 两种输入模式；
+- 渲染改为 framebuffer 直写，并做增量刷新。
 
-- 地址可见性判断；
-- 读写权限判断；
-- 虚拟地址到可访问指针的转换。
+## 3. 实现过程
 
-### 3.2 三种请求的实现
+### 3.1 先把 chapter 3 的外设能力迁移过来
 
-- `trace_request = 0`（读）：
-  - 使用 `READABLE = build_flags("U_RV")`；
-  - 翻译失败返回 `-1`；成功返回目标字节值。
-- `trace_request = 1`（写）：
-  - 使用 `WRITABLE = build_flags("U_W_V")`；
-  - 翻译失败返回 `-1`；成功写入 `data as u8` 并返回 `0`。
-- `trace_request = 2`（统计）：
-  - 返回 `process.syscall_count(id)`。
+用户态俄罗斯方块依赖图形和输入，所以先把 chapter 3 中已验证过的能力移到 chapter 4：
 
-### 3.3 “本次调用计入统计”的保证
+- `gpu.rs`：VirtIO GPU 初始化与 framebuffer 维护；
+- `uart.rs`：UART 非阻塞读取；
+- `plic.rs`：UART 中断的 claim/complete 流程。
 
-在 `schedule()` 处理 `UserEnvCall` 时：
+迁移后，内核在启动时会先初始化图形与输入，再继续加载用户程序。
 
-1. 先从 `a7` 取 syscall id；
-2. 调用 `process.record_syscall(id.0)` 记数；
-3. 再进入 `tg_syscall::handle(...)` 执行 `trace`。
+### 3.2 再把 framebuffer 接到进程地址空间
 
-因此当 `trace_request=2` 查询时，当前这次调用已经计入。
+chapter 4 的用户程序不能再直接使用物理地址，所以 framebuffer syscall 采用“固定虚拟地址 + 首次映射”的方式：
 
----
+- 用户态始终把 framebuffer 看成 `0x1000_0000`；
+- 内核在第一次 `framebuffer_info()` 时，检查当前进程是否已经映射；
+- 如果没有，则把物理 framebuffer 映射进当前进程页表；
+- 之后用户程序可以一直使用这个固定虚拟地址画图。
 
-## 4. mmap 实现
+这样做的好处是：用户态渲染代码和 chapter 3 保持一致，只是底层从“物理地址”变成了“固定虚拟地址”。
 
-函数签名：
+### 3.3 最后完成用户态 tetris
 
-```rust
-fn mmap(&self, caller: Caller, addr: usize, len: usize, prot: i32, _flags: i32, _fd: i32, _offset: usize) -> isize
-```
+`tetris.rs` 中实现了：
 
-## 4.1 参数与合法性检查
+- 7 种方块的形状表；
+- `W` 旋转与简单 wall-kick；
+- 行消除和分数计算；
+- 速度随等级提升而增加；
+- `p/i` 两种输入模式；
+- framebuffer 的增量渲染。
 
-当前实现覆盖了题目要求的主要错误场景：
+渲染部分使用上一帧状态缓存：只在当前帧与上一帧不一致时才重绘对应格子或 HUD 区域。
 
-- `addr` 必须页对齐；
-- `prot` 仅允许低 3 位，且不能全 0；
-- `addr + len` 使用 `checked_add` 防溢出；
-- 目标映射区间不得与已有 `areas` 重叠。
+## 4. 实现中遇到的问题与修复
 
-零长度映射按成功处理（返回 `0`）。
+### 4.1 开启 Sv39 后出现 StorePageFault
 
-## 4.2 权限构造与映射
+一开始运行时，调度线程报了 `StorePageFault`，`stval` 落在 `0x1000_xxxx` 一带。
 
-- 初始 flags 模板：`"U___V"`；
-- 按 `prot` 映射到 `X/W/R` 位；
-- 使用 `address_space.map(range, &[], 0, flags)` 建立匿名页映射。
+原因不是内存不够，而是：
 
-这满足题目“按页向上取整映射、不要求指定物理位置”的简化约束。
+- 内核启用了地址空间；
+- 但 UART / VirtIO / PLIC 这些设备 MMIO 地址没有被映射到内核页表；
+- 结果内核访问设备寄存器时直接页故障。
 
----
+修复方式：
 
-## 5. munmap 实现
+- 在 `kernel_space()` 里补上设备 MMIO 恒等映射；
+- 重点映射 UART、VirtIO MMIO 和 PLIC 区域；
+- 重新编译后页故障消失。
 
-函数签名：
+### 4.2 framebuffer 地址必须是用户虚拟地址
 
-```rust
-fn munmap(&self, caller: Caller, addr: usize, len: usize) -> isize
-```
+chapter 3 里用户态直接拿 framebuffer 物理地址就能用，但 chapter 4 开启地址空间后不能这样做。
 
-## 5.1 参数检查
+修复方式：
 
-- `addr` 页对齐；
-- `addr + len` 防溢出；
-- 零长度区间返回 `0`。
+- 将 framebuffer syscall 扩展为返回固定虚拟地址 `0x1000_0000`；
+- 由内核把物理 framebuffer 映射到该虚拟地址；
+- 用户态只认这个虚拟地址，不再关心物理地址。
 
-## 5.2 映射完整性检查
+### 4.3 防止重复映射
 
-在调用 `unmap` 前，逐页验证目标区间每个 `vpn` 都已被某个 `area` 覆盖；
-若存在未映射页则返回 `-1`，避免部分错误解除映射。
+如果 framebuffer syscall 每次都重新映射，容易污染进程地址空间，也没有必要。
 
-## 5.3 解除映射
+修复方式：
 
-验证通过后执行 `process.address_space.unmap(range)`，返回 `0`。
+- 在 `Process` 中增加 `fb_mapped` 标志；
+- 只有第一次 syscall 建立映射；
+- 后续调用只返回 framebuffer 信息。
 
----
+### 4.4 用户态渲染太重
 
-## 6. 与 chapter4 框架的集成
+俄罗斯方块如果每帧整块重画，写 framebuffer 的代价较高。
 
-- syscall 初始化中启用了 `tg_syscall::init_trace` 与 `init_memory`；
-- `Process` 统一维护地址空间与 syscall 计数；
-- `trace/mmap/munmap` 无需改动调度事件模型，作为普通 syscall 返回 `Done` 分支。
+修复方式：
 
-这样既满足练习目标，也保持了 chapter4 既有执行路径不变。
+- 加入 `RenderState`；
+- 首帧全量绘制；
+- 后续只重绘变化的棋盘格、模式条、分数条、等级条和结束遮罩；
+- 最后统一 flush。
 
----
+## 5. 验证结果
 
-## 7. 验证方式
+已完成并验证：
 
-在 `tg-rcore-tutorial-ch4-T1L2` 目录运行：
+- `ch4-T3L4` `cargo build` 通过；
+- 用户态 `tetris` 能被内核打包并装载；
+- framebuffer syscall 在地址空间下可用；
+- MMIO 映射后设备访问不再触发页错误。
 
-```bash
-cargo run --features exercise
-```
+## 6. 后续优化方向
 
-或：
-
-```bash
-./test.sh exercise
-```
-
-重点关注：
-
-- 非法读写地址时 `trace` 返回 `-1`；
-- `mmap` 在非法参数/重叠映射时返回 `-1`；
-- `munmap` 在区间含未映射页时返回 `-1`；
-- exercise 测例整体通过。
-
----
-
-## 8. 已知边界
-
-当前实现遵循练习“最小可用”原则，仍有教学化简：
-
-- 未实现高级回收策略与失败回滚；
-- 仅支持匿名映射语义（忽略文件参数）；
-- 错误处理优先保证语义正确，不追求复杂优化。
-
-这些边界与 chapter4 目标一致，可在后续章节继续演进。
+- 进一步优化渲染，把多个变化格子合并成脏矩形；
+- 增强旋转 kick 规则，提升贴墙旋转体验；
+- 把中断式输入升级成更完整的事件队列。

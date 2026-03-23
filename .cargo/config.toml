@@ -8,9 +8,13 @@ target = "riscv64gc-unknown-none-elf"
 # 等价于：qemu-system-riscv64 -machine virt -nographic -bios none -kernel <编译产物>
 [target.riscv64gc-unknown-none-elf]
 runner = [
+    "env",
+    "SDL_RENDER_DRIVER=software",
     "qemu-system-riscv64",
     "-machine", "virt",       # 使用 QEMU virt 虚拟平台
-    "-nographic",             # 无图形界面，输出重定向到终端
+    "-device", "virtio-gpu-device", # 挂载 VirtIO GPU 设备
+    "-display", "sdl",
+    "-serial", "stdio",       # 串口直连终端：键盘输入直接进入 UART
     "-bios", "none",          # 不加载外部 BIOS/SBI 固件（tg-sbi 内建）
     "-kernel",                # 后接 ELF 可执行文件路径（由 cargo 自动填充）
 ]
@@ -20,6 +24,6 @@ runner = [
 # TG_USER_LOCAL_DIR: 本地缓存目录名（位于 chN/ 下）
 # TG_USER_VERSION : 目标版本号
 [env]
-TG_USER_CRATE     = "tg-rcore-tutorial-user"
-TG_USER_LOCAL_DIR = "tg-rcore-tutorial-user"
-TG_USER_VERSION   = "0.4.5"
+TG_USER_CRATE     = "tg-rcore-tutorial-user-T3L3"
+TG_USER_LOCAL_DIR = "tg-rcore-tutorial-user-T3L3"
+TG_USER_VERSION   = "0.0.1-preview.2"

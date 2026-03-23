@@ -1,6 +1,6 @@
 [package]
-name = "tg-rcore-tutorial-ch4-T1L2"
-description = "Chapter 4 T1L2 of rCore Tutorial: Address space management with SV39 virtual memory."
+name = "tg-rcore-tutorial-ch4-T3L4"
+description = "Chapter 4 T3L4 of rCore Tutorial: Address space management with SV39 virtual memory."
 version = "0.0.1-preview.1"
 edition = "2024"
 authors = ["YdrMaster <ydrml@hotmail.com>","Yifan Wang<w-yf22@mails.tsinghua.edu.cn>","Yu Chen <yuchen@tsinghua.edu.cn>"]
@@ -29,13 +29,14 @@ panic = "abort"
 xmas-elf = "0.8.0"
 riscv = "0.10.1"
 
-tg-sbi = { package = "tg-rcore-tutorial-sbi", version = "0.4.5", features = ["nobios"] }
+tg-sbi = { package = "tg-rcore-tutorial-sbi-T2L2", version = "0.0.1-preview.2", features = ["nobios"] }
 tg-linker = { package = "tg-rcore-tutorial-linker", version = "0.4.5" }
 tg-console = { package = "tg-rcore-tutorial-console", version = "0.4.5" }
 tg-kernel-context = { package = "tg-rcore-tutorial-kernel-context", version = "0.4.5", features = ["foreign"] }
 tg-kernel-alloc = { package = "tg-rcore-tutorial-kernel-alloc", version = "0.4.5" }
 tg-kernel-vm = { package = "tg-rcore-tutorial-kernel-vm", version = "0.4.5" }
 tg-syscall = { package = "tg-rcore-tutorial-syscall", version = "0.4.5", features = ["kernel"] }
+virtio-drivers = { package = "virtio-drivers", version = "0.1.0" }
 
 [build-dependencies]
 tg-linker = { package = "tg-rcore-tutorial-linker", version = "0.4.5" }

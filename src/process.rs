@@ -63,6 +63,8 @@ pub struct Process {
     pub heap_bottom: usize,
     /// 当前程序 break 位置（堆顶）
     pub program_brk: usize,
+    /// framebuffer 是否已映射到固定用户虚拟地址。
+    pub fb_mapped: bool,
     syscall_counts: [usize; SYSCALL_COUNT_CAPACITY],
 }
 
@@ -165,6 +167,7 @@ impl Process {
             address_space,
             heap_bottom,
             program_brk: heap_bottom,
+            fb_mapped: false,
             syscall_counts: [0; SYSCALL_COUNT_CAPACITY],
         })
     }
